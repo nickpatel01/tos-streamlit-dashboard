@@ -31,26 +31,26 @@ class DashboardLayout:
         col1, col2, col3, col4, col5, button_col = st.columns([2, 2, 2, 2, 2, 1])
 
         with col1:
-            symbol = st.text_input("Symbol:", value="SPY").upper()
+            symbol = st.text_input("Symbol:", value="SPX").upper()
         with col2:
             expiry_date = st.date_input(
                 "Expiry Date:",
-                # Default to the nearest Friday
-                value=DashboardLayout._get_nearest_friday(),
+                # Default to today
+                value=date.today(),
                 format="MM/DD/YYYY"
             )
         with col3:
-            strike_range = st.number_input("Strike Range $(±)", value=10, min_value=1, max_value=500)
+            strike_range = st.number_input("Strike Range $(±)", value=30, min_value=1, max_value=500)
         with col4:
             strike_spacing = st.selectbox(
                 "Strike Spacing",
                 options=[0.5, 1.0, 2.5, 5.0, 10.0, 25.0],
-                index=1  # Default to 1.0
+                index=3  # Default to 5.0
             )
         with col5:
             refresh_rate = st.number_input(
                 "Refresh Rate (s)",
-                value=15,
+                value=60,
                 min_value=1,
                 max_value=300,
                 help="Chart refresh interval in seconds"
