@@ -42,14 +42,34 @@ class RTDWorker:
                 while retry_count < 3:  # Try up to 3 times
                     try:
                         if symbol.startswith('.'):
-                            if self.client.subscribe(QuoteType.GAMMA, symbol):
-                                success_count += 1
-                            if self.client.subscribe(QuoteType.OPEN_INT, symbol):
-                                success_count += 1
+                            # Subscribe to options data
+                            quote_types = [
+                                QuoteType.GAMMA,
+                                QuoteType.OPEN_INT,
+                                QuoteType.IMPL_VOL,
+                                QuoteType.DELTA,
+                                QuoteType.THETA,
+                                QuoteType.VEGA,
+                                QuoteType.RHO,
+                                QuoteType.PROB_OF_EXPIRING,
+                                QuoteType.PROB_OTM,
+                                QuoteType.PROB_OF_TOUCHING
+                            ]
+                            for quote_type in quote_types:
+                                if self.client.subscribe(quote_type, symbol):
+                                    success_count += 1
                         else:
-                            print(f"Subscribing to LAST for {symbol}")
-                            if self.client.subscribe(QuoteType.LAST, symbol):
-                                success_count += 1
+                            # Subscribe to underlying stock data
+                            print(f"Subscribing to data for {symbol}")
+                            quote_types = [
+                                QuoteType.LAST,
+                                QuoteType.MRKT_MKR_MOVE,
+                                QuoteType.FRONT_EX_MOVE,
+                                QuoteType.BACK_EX_MOVE
+                            ]
+                            for quote_type in quote_types:
+                                if self.client.subscribe(quote_type, symbol):
+                                    success_count += 1
                         break  # Success, exit retry loop
                     except Exception as sub_error:
                         retry_count += 1
