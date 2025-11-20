@@ -6,3 +6,4 @@ PyYAML
 tabulate
 streamlit
 plotly
+kaleido
