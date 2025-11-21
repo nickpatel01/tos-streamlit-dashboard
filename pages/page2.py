@@ -119,12 +119,20 @@ col_title, col_download_all = st.columns([5, 1])
 with col_title:
     st.title("📊 Options Dashboard")
 with col_download_all:
-    # Export all visible charts button - generates HTML instead of PNG
+    # Export all visible charts button - generates HTML, PNG, or JPEG
     if st.session_state.p2_data_ready:
-        if st.button("📥 Export All", key="export_all_btn", help="Download all visible charts as interactive HTML"):
+        export_format = st.selectbox(
+            "Export Format",
+            options=["PNG Image", "JPEG Image", "HTML (Interactive)"],
+            index=0,  # PNG as default
+            key="export_format_select"
+        )
+        
+        if st.button("📥 Export All", key="export_all_btn", help="Download all visible charts in selected format"):
             try:
                 from plotly.subplots import make_subplots
                 import plotly.graph_objects as go
+                from PIL import Image, ImageDraw, ImageFont
                 
                 # Collect all visible charts
                 charts_to_combine = []
@@ -153,43 +161,157 @@ with col_download_all:
                     chart_titles.append("Probability")
                 
                 if charts_to_combine:
-                    with st.spinner('Generating HTML export...'):
-                        # Create subplots with all charts stacked vertically
-                        num_charts = len(charts_to_combine)
-                        fig_combined = make_subplots(
-                            rows=num_charts, 
-                            cols=1,
-                            subplot_titles=chart_titles,
-                            vertical_spacing=0.08,
-                            row_heights=[1] * num_charts
-                        )
+                    # Get Eastern timezone
+                    from zoneinfo import ZoneInfo
+                    eastern = ZoneInfo("America/New_York")
+                    now_eastern = datetime.now(eastern)
+                    timestamp = now_eastern.strftime("%Y-%m-%d_%I-%M-%S")  # 12-hour format
+                    
+                    # Get header info
+                    current_price = st.session_state.get('p2_current_price', 0)
+                    last_refresh = st.session_state.get('p2_last_refresh_time', datetime.now())
+                    
+                    # Convert last_refresh to Eastern time if it's not already
+                    if last_refresh.tzinfo is None:
+                        last_refresh = last_refresh.replace(tzinfo=ZoneInfo("UTC")).astimezone(eastern)
+                    refresh_time_str = last_refresh.strftime("%Y-%m-%d %I:%M:%S")  # 12-hour format
+                    header_text = f"{st.session_state.p2_symbol} | Price: ${current_price:.2f} | Last Refresh: {refresh_time_str}"
+                    
+                    if export_format == "HTML (Interactive)":
+                        with st.spinner('Generating HTML export...'):
+                            # Create subplots with all charts stacked vertically
+                            num_charts = len(charts_to_combine)
+                            fig_combined = make_subplots(
+                                rows=num_charts, 
+                                cols=1,
+                                subplot_titles=chart_titles,
+                                vertical_spacing=0.08,
+                                row_heights=[1] * num_charts
+                            )
+                            
+                            # Add each chart to the combined figure
+                            for idx, chart in enumerate(charts_to_combine):
+                                row_num = idx + 1
+                                for trace in chart.data:
+                                    fig_combined.add_trace(trace, row=row_num, col=1)
+                            
+                            # Update layout with header info
+                            fig_combined.update_layout(
+                                height=600 * num_charts,
+                                showlegend=True,
+                                title_text=f"{header_text}<br><sub>Options Dashboard - {num_charts} Charts</sub>"
+                            )
+                            
+                            # Generate HTML
+                            html_str = fig_combined.to_html(include_plotlyjs='cdn')
+                            filename = f"{st.session_state.p2_symbol}-{timestamp}.html"
+                            
+                            st.download_button(
+                                label="⬇️ Download Interactive HTML",
+                                data=html_str,
+                                file_name=filename,
+                                mime="text/html",
+                                key="download_combined_html"
+                            )
+                            # Auto-dismiss success message
+                            success_placeholder = st.empty()
+                            success_placeholder.success(f"✅ Export ready! ({num_charts} charts combined) - Interactive HTML with zoom and pan")
+                            import time
+                            time.sleep(5)
+                            success_placeholder.empty()
+                    
+                    else:  # PNG or JPEG export
+                        img_format = "png" if export_format == "PNG Image" else "jpeg"
+                        mime_type = f"image/{img_format}"
                         
-                        # Add each chart to the combined figure
-                        for idx, chart in enumerate(charts_to_combine):
-                            row_num = idx + 1
-                            for trace in chart.data:
-                                fig_combined.add_trace(trace, row=row_num, col=1)
-                        
-                        # Update layout
-                        fig_combined.update_layout(
-                            height=600 * num_charts,
-                            showlegend=True,
-                            title_text=f"{st.session_state.p2_symbol} Options Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                        
-                        # Generate HTML
-                        html_str = fig_combined.to_html(include_plotlyjs='cdn')
-                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                        filename = f"{st.session_state.p2_symbol}-{timestamp}.html"
-                        
-                        st.download_button(
-                            label="⬇️ Download Interactive HTML",
-                            data=html_str,
-                            file_name=filename,
-                            mime="text/html",
-                            key="download_combined_html"
-                        )
-                        st.success(f"Export ready! ({num_charts} charts combined) - Interactive HTML with zoom and pan capabilities")
+                        with st.spinner(f'Generating {img_format.upper()} export...'):
+                            # Convert all charts to images
+                            images = []
+                            for i, fig in enumerate(charts_to_combine):
+                                try:
+                                    # Create a simplified copy for export
+                                    fig_copy = go.Figure(fig)
+                                    
+                                    # Simplify layout to avoid Error 525
+                                    fig_copy.update_layout(
+                                        title=dict(text=chart_titles[i], font=dict(size=16)),
+                                        showlegend=True,
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                        annotations=[]  # Remove complex annotations that cause Error 525
+                                    )
+                                    
+                                    img_bytes = pio.to_image(fig_copy, format=img_format, width=1200, height=600)
+                                    images.append(Image.open(BytesIO(img_bytes)))
+                                except Exception as fig_error:
+                                    # Use empty placeholder for auto-dismissing warning
+                                    warning_placeholder = st.empty()
+                                    warning_placeholder.warning(f"⚠️ Skipped {chart_titles[i]} due to error: {fig_error}")
+                                    # Auto-dismiss after 5 seconds
+                                    import time
+                                    time.sleep(5)
+                                    warning_placeholder.empty()
+                                    continue
+                            
+                            if images:
+                                # Create header image with info
+                                header_height = 80
+                                max_width = max(img.width for img in images)
+                                header_img = Image.new('RGB', (max_width, header_height), 'white')
+                                draw = ImageDraw.Draw(header_img)
+                                
+                                # Try to use a nice font, fallback to default
+                                try:
+                                    font = ImageFont.truetype("arial.ttf", 24)
+                                    small_font = ImageFont.truetype("arial.ttf", 18)
+                                except:
+                                    font = ImageFont.load_default()
+                                    small_font = ImageFont.load_default()
+                                
+                                # Draw header text
+                                draw.text((20, 15), f"{st.session_state.p2_symbol}", fill='black', font=font)
+                                draw.text((20, 45), f"Price: ${current_price:.2f} | Last Refresh: {refresh_time_str}", fill='gray', font=small_font)
+                                
+                                # Combine header with images vertically
+                                total_height = header_height + sum(img.height for img in images)
+                                mode = 'RGB'
+                                combined_image = Image.new(mode, (max_width, total_height), 'white')
+                                
+                                # Paste header
+                                combined_image.paste(header_img, (0, 0))
+                                
+                                # Paste charts
+                                y_offset = header_height
+                                for img in images:
+                                    if img.mode != mode:
+                                        img = img.convert(mode)
+                                    combined_image.paste(img, (0, y_offset))
+                                    y_offset += img.height
+                                
+                                # Convert to bytes
+                                buf = BytesIO()
+                                if img_format == "jpeg":
+                                    combined_image.save(buf, format='JPEG', quality=95)
+                                else:
+                                    combined_image.save(buf, format='PNG')
+                                combined_bytes = buf.getvalue()
+                                
+                                filename = f"{st.session_state.p2_symbol}-{timestamp}.{img_format}"
+                                
+                                st.download_button(
+                                    label=f"⬇️ Download {img_format.upper()} Image",
+                                    data=combined_bytes,
+                                    file_name=filename,
+                                    mime=mime_type,
+                                    key=f"download_combined_{img_format}"
+                                )
+                                # Auto-dismiss success message
+                                success_placeholder = st.empty()
+                                success_placeholder.success(f"✅ Export ready! ({len(images)} charts combined)")
+                                import time
+                                time.sleep(5)
+                                success_placeholder.empty()
+                            else:
+                                st.error("No charts could be converted. Try HTML export instead.")
                 else:
                     st.info("No charts selected for export. Enable at least one chart.")
             except Exception as e:
