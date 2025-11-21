@@ -7,3 +7,4 @@ tabulate
 streamlit
 plotly
 kaleido
+Pillow

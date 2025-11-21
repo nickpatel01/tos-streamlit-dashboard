@@ -22,7 +22,7 @@ class OptionSymbolBuilder:
     @staticmethod
     def build_symbols(base_symbol: str, expiry: date, current_price: float, strike_range: int, strike_spacing: float) -> list:
         """
-        Builds a list of option symbols for both calls and puts
+        Builds a list of option symbols for both calls and puts using ± range around current price
         Returns: List of option symbols in ThinkorSwim format
         Example: .SPY250129C601
         """
@@ -48,6 +48,48 @@ class OptionSymbolBuilder:
             rounded_price + strike_range,
             num_strikes
         )
+        
+        symbols = []
+        date_str = expiry.strftime("%y%m%d")
+        
+        for strike in strikes:
+            # Format strike string: only show decimal for .5 strikes
+            if (strike_spacing in [0.5, 2.5] and 
+                abs(strike % 1 - 0.5) < 0.001):  # Handle floating point comparison
+                strike_str = f"{strike:.1f}"
+            else:
+                strike_str = f"{int(strike)}"
+                
+            call_symbol = f".{base_symbol}{date_str}C{strike_str}"
+            put_symbol = f".{base_symbol}{date_str}P{strike_str}"
+            symbols.extend([call_symbol, put_symbol])
+        
+        return symbols
+
+    @staticmethod
+    def build_symbols_from_range(base_symbol: str, expiry: date, strike_low: float, strike_high: float, strike_spacing: float) -> list:
+        """
+        Builds a list of option symbols for both calls and puts using absolute strike range
+        Returns: List of option symbols in ThinkorSwim format
+        Example: .SPY250129C601
+        """
+
+        # Only convert symbols if it's NOT the third Friday of the month
+        if not OptionSymbolBuilder._is_third_friday(expiry):
+            if base_symbol == "SPX":
+                base_symbol = "SPXW"
+            elif base_symbol == "NDX":
+                base_symbol = "NDXP"
+            elif base_symbol == "RUT":
+                base_symbol = "RUTW"
+  
+        # Round strikes to nearest valid values
+        strike_low = OptionSymbolBuilder._round_to_nearest_strike(strike_low, strike_spacing)
+        strike_high = OptionSymbolBuilder._round_to_nearest_strike(strike_high, strike_spacing)
+        
+        # Generate strike prices using numpy arange
+        num_strikes = int((strike_high - strike_low) / strike_spacing) + 1
+        strikes = np.linspace(strike_low, strike_high, num_strikes)
         
         symbols = []
         date_str = expiry.strftime("%y%m%d")

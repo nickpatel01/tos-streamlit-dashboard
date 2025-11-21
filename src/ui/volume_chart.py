@@ -80,6 +80,9 @@ class VolumeChartBuilder:
                 put_volumes.append(put_vol)
                 
             except StopIteration:
+                call_volumes.append(0)
+                put_volumes.append(0)
+            except Exception as e:
                 print(f"Error calculating volume for strike {strike}: {e}")
                 call_volumes.append(0)
                 put_volumes.append(0)

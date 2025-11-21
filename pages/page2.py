@@ -3,8 +3,11 @@ import time
 import threading
 from queue import Queue
 from datetime import datetime, date
+from io import BytesIO
+import atexit
 import streamlit as st
 import plotly.io as pio
+from PIL import Image
 from src.rtd.rtd_worker import RTDWorker
 from src.utils.option_symbol_builder import OptionSymbolBuilder
 from src.ui.gamma_chart import GammaChartBuilder
@@ -16,7 +19,26 @@ from src.ui.expected_move_chart import ExpectedMoveChartBuilder
 from src.ui.volume_chart import VolumeChartBuilder
 
 # Page configuration
-st.set_page_config(page_title="Page 2 - 5 Charts View", layout="wide")
+st.set_page_config(page_title="Page 2 - Dashboard", layout="wide")
+
+# Cleanup handler for graceful shutdown
+def cleanup_on_exit():
+    """Clean up RTD connections on exit"""
+    if 'p2_stop_event' in st.session_state:
+        st.session_state.p2_stop_event.set()
+    if 'p2_active_thread' in st.session_state and st.session_state.p2_active_thread:
+        try:
+            st.session_state.p2_active_thread.join(timeout=2.0)
+        except:
+            pass
+    if 'p2_rtd_worker' in st.session_state and st.session_state.p2_rtd_worker:
+        try:
+            st.session_state.p2_rtd_worker.cleanup()
+        except:
+            pass
+
+# Register cleanup handler
+atexit.register(cleanup_on_exit)
 
 # Initialize session state for page2
 if 'p2_initialized' not in st.session_state:
@@ -27,6 +49,7 @@ if 'p2_initialized' not in st.session_state:
     st.session_state.p2_current_price = None
     st.session_state.p2_option_symbols = []
     st.session_state.p2_active_thread = None
+    st.session_state.p2_rtd_worker = None
     st.session_state.p2_last_gamma_figure = None
     st.session_state.p2_last_abs_gamma_figure = None
     st.session_state.p2_last_iv_figure = None
@@ -37,21 +60,29 @@ if 'p2_initialized' not in st.session_state:
     st.session_state.p2_loading_complete = False
     st.session_state.p2_last_refresh = None
     st.session_state.p2_auto_refresh = True
+    st.session_state.p2_data_ready = False
+    st.session_state.p2_cached_data = None  # Cache the latest RTD data
     # Chart visibility toggles
     st.session_state.p2_show_gex = True
     st.session_state.p2_show_abs_gex = True
     st.session_state.p2_show_iv = True
     st.session_state.p2_show_greeks = True
-    st.session_state.p2_show_prob = True
+    st.session_state.p2_show_prob = False  # Disabled by default - no RTD data
     st.session_state.p2_show_expected = True
-    st.session_state.p2_show_volume = True
+    st.session_state.p2_show_volume = False  # Disabled by default - no RTD data
 
-# Custom CSS
+# Custom CSS for responsive UI
 st.markdown("""
 <style>
     [data-testid="stStatusWidget"] {visibility: hidden;}
     .stDeployButton {visibility: hidden;}
-    div.stButton > button {width: 100%;}
+    div.stButton > button {
+        width: 100%;
+        transition: all 0.3s ease;
+    }
+    div.stButton > button:hover {
+        transform: scale(1.02);
+    }
     .chart-header {
         display: flex;
         justify-content: space-between;
@@ -66,6 +97,7 @@ st.markdown("""
         background: #f0f2f6;
         padding: 10px 15px;
         border-radius: 5px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .control-section {
         background: #f8f9fa;
@@ -73,17 +105,103 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 20px;
     }
+    @media (max-width: 768px) {
+        .info-label {
+            font-size: 14px;
+            padding: 8px 12px;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Title
-st.title("📊 Options Dashboard")
+# Title and header
+col_title, col_download_all = st.columns([5, 1])
+with col_title:
+    st.title("📊 Options Dashboard")
+with col_download_all:
+    # Export all visible charts button - generates HTML instead of PNG
+    if st.session_state.p2_data_ready:
+        if st.button("📥 Export All", key="export_all_btn", help="Download all visible charts as interactive HTML"):
+            try:
+                from plotly.subplots import make_subplots
+                import plotly.graph_objects as go
+                
+                # Collect all visible charts
+                charts_to_combine = []
+                chart_titles = []
+                
+                if st.session_state.p2_show_gex and st.session_state.p2_last_gamma_figure:
+                    charts_to_combine.append(st.session_state.p2_last_gamma_figure)
+                    chart_titles.append("Gamma Exposure")
+                if st.session_state.p2_show_expected and st.session_state.p2_last_expected_move_figure:
+                    charts_to_combine.append(st.session_state.p2_last_expected_move_figure)
+                    chart_titles.append("Expected Move")
+                if st.session_state.p2_show_abs_gex and st.session_state.p2_last_abs_gamma_figure:
+                    charts_to_combine.append(st.session_state.p2_last_abs_gamma_figure)
+                    chart_titles.append("Absolute GEX")
+                if st.session_state.p2_show_volume and st.session_state.p2_last_volume_figure:
+                    charts_to_combine.append(st.session_state.p2_last_volume_figure)
+                    chart_titles.append("Volume")
+                if st.session_state.p2_show_iv and st.session_state.p2_last_iv_figure:
+                    charts_to_combine.append(st.session_state.p2_last_iv_figure)
+                    chart_titles.append("Implied Volatility")
+                if st.session_state.p2_show_greeks and st.session_state.p2_last_greeks_figure:
+                    charts_to_combine.append(st.session_state.p2_last_greeks_figure)
+                    chart_titles.append("Greeks")
+                if st.session_state.p2_show_prob and st.session_state.p2_last_prob_figure:
+                    charts_to_combine.append(st.session_state.p2_last_prob_figure)
+                    chart_titles.append("Probability")
+                
+                if charts_to_combine:
+                    with st.spinner('Generating HTML export...'):
+                        # Create subplots with all charts stacked vertically
+                        num_charts = len(charts_to_combine)
+                        fig_combined = make_subplots(
+                            rows=num_charts, 
+                            cols=1,
+                            subplot_titles=chart_titles,
+                            vertical_spacing=0.08,
+                            row_heights=[1] * num_charts
+                        )
+                        
+                        # Add each chart to the combined figure
+                        for idx, chart in enumerate(charts_to_combine):
+                            row_num = idx + 1
+                            for trace in chart.data:
+                                fig_combined.add_trace(trace, row=row_num, col=1)
+                        
+                        # Update layout
+                        fig_combined.update_layout(
+                            height=600 * num_charts,
+                            showlegend=True,
+                            title_text=f"{st.session_state.p2_symbol} Options Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        
+                        # Generate HTML
+                        html_str = fig_combined.to_html(include_plotlyjs='cdn')
+                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        filename = f"{st.session_state.p2_symbol}-{timestamp}.html"
+                        
+                        st.download_button(
+                            label="⬇️ Download Interactive HTML",
+                            data=html_str,
+                            file_name=filename,
+                            mime="text/html",
+                            key="download_combined_html"
+                        )
+                        st.success(f"Export ready! ({num_charts} charts combined) - Interactive HTML with zoom and pan capabilities")
+                else:
+                    st.info("No charts selected for export. Enable at least one chart.")
+            except Exception as e:
+                st.error(f"Export failed: {str(e)}")
+                print(f"Export error: {e}")
 
 # Header info bar
 if 'p2_symbol' in st.session_state and st.session_state.p2_last_refresh:
-    st.markdown(f'<div class="info-label">📈 {st.session_state.p2_symbol} | 🕐 Last Refresh: {st.session_state.p2_last_refresh}</div>', unsafe_allow_html=True)
+    price_display = f'<span style="color: #1E90FF; font-weight: bold; font-size: 18px;">${st.session_state.p2_current_price:.2f}</span>' if st.session_state.p2_current_price else '<span style="color: gray;">--</span>'
+    st.markdown(f'<div class="info-label">📈 {st.session_state.p2_symbol} | 💰 Price: {price_display} | 🕐 Last Refresh: {st.session_state.p2_last_refresh}</div>', unsafe_allow_html=True)
 else:
-    st.markdown('<div class="info-label">📈 Symbol: -- | 🕐 Last Refresh: --</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-label">📈 Symbol: -- | 💰 Price: <span style="color: gray;">--</span> | 🕐 Last Refresh: --</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -98,7 +216,7 @@ with st.container():
     with col2:
         refresh_rate = st.number_input(
             "Refresh Rate (seconds)",
-            value=60,
+            value=180,
             min_value=5,
             max_value=300,
             step=5,
@@ -135,14 +253,14 @@ with st.container():
         )
     
     with col2:
-        strike_range = st.slider(
-            "Strike Range (±)",
-            min_value=5,
-            max_value=200,
-            value=30,
-            step=5,
-            help="Range of strikes around current price"
-        )
+        # Get current price for range calculation
+        current_price_for_range = st.session_state.p2_current_price if st.session_state.p2_current_price else 6500
+        
+        # Calculate default range around current price
+        default_min = int((current_price_for_range - 100) / 5) * 5
+        default_max = int((current_price_for_range + 100) / 5) * 5
+        range_min = int((current_price_for_range - 300) / 5) * 5
+        range_max = int((current_price_for_range + 300) / 5) * 5
     
     with col3:
         strike_spacing = st.selectbox(
@@ -151,6 +269,25 @@ with st.container():
             index=3,
             help="Spacing between strikes"
         )
+    
+    # Show strike range slider in col2 after spacing is selected
+    with col2:
+        strike_price_range = st.slider(
+            "Strike Price Range",
+            min_value=range_min,
+            max_value=range_max,
+            value=(default_min, default_max),
+            step=int(strike_spacing) if strike_spacing >= 1 else 5,
+            help="Select min and max strike prices to display"
+        )
+        strike_range_low = strike_price_range[0]
+        strike_range_high = strike_price_range[1]
+        
+        # Calculate and display number of strikes
+        num_strikes = int((strike_range_high - strike_range_low) / strike_spacing) + 1
+        # 10 quote types per strike (call+put) × 10 fields + 4 for underlying
+        num_topics = num_strikes * 2 * 10 + 4
+        st.caption(f"📊 {num_strikes} strikes • {num_topics} RTD topics")
 
 st.markdown("---")
 
@@ -175,27 +312,30 @@ with col7:
 
 st.markdown("---")
 
-# Helper function to create download button
-def create_download_button(fig, chart_type):
-    """Create download button for chart with proper filename"""
+# Helper function to create download button with lazy image generation
+def create_download_section(chart_type):
+    """Create download button section that generates image on-demand"""
+    col1, col2 = st.columns([10, 1])
+    with col2:
+        st.caption("📥")
+    return col1
+
+# Actual download handler (only called when button is clicked)
+def generate_chart_download(fig, chart_type):
+    """Generate downloadable image from chart"""
     try:
+        import plotly.graph_objects as go
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{chart_type}_{timestamp}.png"
-        img_bytes = pio.to_image(fig, format='png', width=1200, height=600)
-        col1, col2 = st.columns([10, 1])
-        with col2:
-            st.download_button(
-                label="📥",
-                data=img_bytes,
-                file_name=filename,
-                mime="image/png",
-                key=f"download_{chart_type}_{timestamp}",
-                help=f"Download {chart_type} chart"
-            )
-        return col1
+        
+        # Create a copy to avoid state corruption
+        fig_copy = go.Figure(fig)
+        img_bytes = pio.to_image(fig_copy, format='png', width=1200, height=600)
+        
+        return img_bytes, filename
     except Exception as e:
-        print(f"Download button error for {chart_type}: {e}")
-        return st.container()
+        print(f"Download generation error for {chart_type}: {e}")
+        return None, None
 
 # Store symbol for header display
 st.session_state.p2_symbol = symbol
@@ -221,10 +361,9 @@ if 'p2_chart_builder' not in st.session_state:
     st.session_state.p2_expected_move_builder = ExpectedMoveChartBuilder(symbol)
     st.session_state.p2_last_gamma_figure = st.session_state.p2_chart_builder.create_empty_chart()
 
-# Display initial empty chart
-if st.session_state.p2_last_gamma_figure and st.session_state.p2_show_gex:
-    chart_placeholders['gex'] = create_download_button(st.session_state.p2_last_gamma_figure, "GEX")
-    chart_placeholders['gex'].plotly_chart(st.session_state.p2_last_gamma_figure, use_container_width=True, key="p2_main_chart")
+# Display initial empty chart (only when not initialized yet)
+if not st.session_state.p2_initialized and st.session_state.p2_last_gamma_figure and st.session_state.p2_show_gex:
+    st.plotly_chart(st.session_state.p2_last_gamma_figure, width='stretch', key="p2_initial_chart")
 
 # Handle start/stop button clicks
 if start_stop_button:
@@ -251,8 +390,8 @@ if start_stop_button:
             st.session_state.p2_expected_move_builder = ExpectedMoveChartBuilder(symbol)
             st.session_state.p2_last_gamma_figure = st.session_state.p2_chart_builder.create_empty_chart()
             if st.session_state.p2_show_gex:
-                chart_placeholders['gex'] = create_download_button(st.session_state.p2_last_gamma_figure, "GEX")
-                chart_placeholders['gex'].plotly_chart(st.session_state.p2_last_gamma_figure, use_container_width=True, key="p2_reset_chart")
+                chart_placeholders['gex'] = st.container()
+                chart_placeholders['gex'].plotly_chart(st.session_state.p2_last_gamma_figure, width='stretch', key="p2_reset_chart")
             st.session_state.p2_last_symbol = symbol
         
         # Start with stock symbol only to get price first
@@ -297,8 +436,11 @@ if st.session_state.p2_initialized and st.session_state.p2_auto_refresh:
                     # If we just got the price and don't have option symbols yet,
                     # restart with all symbols
                     if not st.session_state.p2_option_symbols:
-                        option_symbols = OptionSymbolBuilder.build_symbols(
-                            symbol, expiry_date, price, strike_range, strike_spacing
+                        # Store current price for range slider
+                        st.session_state.p2_current_price = price
+                        
+                        option_symbols = OptionSymbolBuilder.build_symbols_from_range(
+                            symbol, expiry_date, strike_range_low, strike_range_high, strike_spacing
                         )
                         
                         # Stop current thread
@@ -335,20 +477,56 @@ if st.session_state.p2_initialized and st.session_state.p2_auto_refresh:
                     strikes.sort()
 
                     # Create all 7 charts
-                    gamma_fig = st.session_state.p2_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    abs_gamma_fig = st.session_state.p2_abs_gamma_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    volume_fig = st.session_state.p2_volume_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    iv_fig = st.session_state.p2_iv_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    greeks_fig = st.session_state.p2_greeks_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    prob_fig = st.session_state.p2_prob_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    try:
+                        gamma_fig = st.session_state.p2_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating gamma chart: {e}")
+                        gamma_fig = st.session_state.p2_chart_builder.create_empty_chart()
+                    
+                    try:
+                        abs_gamma_fig = st.session_state.p2_abs_gamma_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating absolute gamma chart: {e}")
+                        abs_gamma_fig = st.session_state.p2_abs_gamma_chart_builder.create_empty_chart()
+                    
+                    try:
+                        volume_fig = st.session_state.p2_volume_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating volume chart: {e}")
+                        volume_fig = st.session_state.p2_volume_chart_builder.create_empty_chart()
+                    
+                    try:
+                        iv_fig = st.session_state.p2_iv_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating IV chart: {e}")
+                        iv_fig = st.session_state.p2_iv_chart_builder.create_empty_chart()
+                    
+                    try:
+                        greeks_fig = st.session_state.p2_greeks_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating greeks chart: {e}")
+                        greeks_fig = st.session_state.p2_greeks_chart_builder.create_empty_chart()
+                    
+                    try:
+                        prob_fig = st.session_state.p2_prob_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                    except Exception as e:
+                        print(f"Error creating probability chart: {e}")
+                        prob_fig = st.session_state.p2_prob_chart_builder.create_empty_chart()
                     
                     # Create a copy of gamma chart for expected move visualization
-                    expected_move_fig = st.session_state.p2_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
-                    expected_move_fig.update_layout(title="Expected Move with GEX")
-                    st.session_state.p2_expected_move_builder.create_reference_lines(expected_move_fig, data)
+                    try:
+                        expected_move_fig = st.session_state.p2_chart_builder.create_chart(data, strikes, st.session_state.p2_option_symbols)
+                        expected_move_fig.update_layout(title="Expected Move with GEX")
+                        st.session_state.p2_expected_move_builder.create_reference_lines(expected_move_fig, data)
+                    except Exception as e:
+                        print(f"Error creating expected move chart: {e}")
+                        expected_move_fig = st.session_state.p2_chart_builder.create_empty_chart()
 
                     # Update last refresh time
                     st.session_state.p2_last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    # Cache the raw data for reuse
+                    st.session_state.p2_cached_data = data
 
                     # Store all figures
                     st.session_state.p2_last_gamma_figure = gamma_fig
@@ -358,77 +536,117 @@ if st.session_state.p2_initialized and st.session_state.p2_auto_refresh:
                     st.session_state.p2_last_greeks_figure = greeks_fig
                     st.session_state.p2_last_prob_figure = prob_fig
                     st.session_state.p2_last_expected_move_figure = expected_move_fig
+                    st.session_state.p2_data_ready = True
 
-                    # Display charts based on toggles
-                    if st.session_state.p2_show_gex:
-                        chart_col = create_download_button(gamma_fig, "GEX")
-                        chart_col.plotly_chart(gamma_fig, use_container_width=True, key="p2_update_gamma")
+                    # Display charts based on toggles - 2 per row
+                    charts_to_display = []
+                    if st.session_state.p2_show_gex and gamma_fig:
+                        charts_to_display.append(('gamma', gamma_fig, f"p2_update_gamma_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_abs_gex:
-                        chart_col = create_download_button(abs_gamma_fig, "AbsoluteGEX")
-                        chart_col.plotly_chart(abs_gamma_fig, use_container_width=True, key="p2_update_abs_gamma")
+                    if st.session_state.p2_show_expected and expected_move_fig:
+                        charts_to_display.append(('expected', expected_move_fig, f"p2_update_expected_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_volume:
-                        chart_col = create_download_button(volume_fig, "Volume")
-                        chart_col.plotly_chart(volume_fig, use_container_width=True, key="p2_update_volume")
+                    if st.session_state.p2_show_abs_gex and abs_gamma_fig:
+                        charts_to_display.append(('abs_gamma', abs_gamma_fig, f"p2_update_abs_gamma_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_iv:
-                        chart_col = create_download_button(iv_fig, "IV")
-                        chart_col.plotly_chart(iv_fig, use_container_width=True, key="p2_update_iv")
+                    if st.session_state.p2_show_volume and volume_fig:
+                        charts_to_display.append(('volume', volume_fig, f"p2_update_volume_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_greeks:
-                        chart_col = create_download_button(greeks_fig, "Greeks")
-                        chart_col.plotly_chart(greeks_fig, use_container_width=True, key="p2_update_greeks")
+                    if st.session_state.p2_show_iv and iv_fig:
+                        charts_to_display.append(('iv', iv_fig, f"p2_update_iv_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_prob:
-                        chart_col = create_download_button(prob_fig, "Probability")
-                        chart_col.plotly_chart(prob_fig, use_container_width=True, key="p2_update_prob")
+                    if st.session_state.p2_show_greeks and greeks_fig:
+                        charts_to_display.append(('greeks', greeks_fig, f"p2_update_greeks_{st.session_state.p2_last_refresh}"))
                     
-                    if st.session_state.p2_show_expected:
-                        chart_col = create_download_button(expected_move_fig, "ExpectedMove")
-                        chart_col.plotly_chart(expected_move_fig, use_container_width=True, key="p2_update_expected")
+                    if st.session_state.p2_show_prob and prob_fig:
+                        charts_to_display.append(('prob', prob_fig, f"p2_update_prob_{st.session_state.p2_last_refresh}"))
+                    
+                    # Display charts in 2-column layout
+                    for i in range(0, len(charts_to_display), 2):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.plotly_chart(charts_to_display[i][1], width='stretch', key=charts_to_display[i][2])
+                        if i + 1 < len(charts_to_display):
+                            with col2:
+                                st.plotly_chart(charts_to_display[i+1][1], width='stretch', key=charts_to_display[i+1][2])
 
                     if not st.session_state.p2_loading_complete:
                         st.session_state.p2_loading_complete = True
                     else:
-                        # Removed blocking time.sleep(refresh_rate / 2)
+                        time.sleep(refresh_rate / 2)
 
                     if st.session_state.p2_initialized:
                         st.rerun()
         else:
             if st.session_state.p2_initialized:
-                # Removed blocking time.sleep(.5)
+                time.sleep(.5)
                 st.rerun()
                 
     except Exception as e:
         st.error(f"Display Error: {str(e)}")
         print(f"Error details: {e}")
 elif st.session_state.p2_initialized and not st.session_state.p2_auto_refresh:
-    # Display static charts when auto-refresh is off
+    # Display static charts when auto-refresh is off - 2 per row
+    static_charts = []
     if st.session_state.p2_last_gamma_figure and st.session_state.p2_show_gex:
-        chart_col = create_download_button(st.session_state.p2_last_gamma_figure, "GEX")
-        chart_col.plotly_chart(st.session_state.p2_last_gamma_figure, use_container_width=True, key="p2_static_gamma")
-    
-    if st.session_state.p2_last_abs_gamma_figure and st.session_state.p2_show_abs_gex:
-        chart_col = create_download_button(st.session_state.p2_last_abs_gamma_figure, "AbsoluteGEX")
-        chart_col.plotly_chart(st.session_state.p2_last_abs_gamma_figure, use_container_width=True, key="p2_static_abs_gamma")
-    
-    if st.session_state.p2_last_volume_figure and st.session_state.p2_show_volume:
-        chart_col = create_download_button(st.session_state.p2_last_volume_figure, "Volume")
-        chart_col.plotly_chart(st.session_state.p2_last_volume_figure, use_container_width=True, key="p2_static_volume")
-    
-    if st.session_state.p2_last_iv_figure and st.session_state.p2_show_iv:
-        chart_col = create_download_button(st.session_state.p2_last_iv_figure, "IV")
-        chart_col.plotly_chart(st.session_state.p2_last_iv_figure, use_container_width=True, key="p2_static_iv")
-    
-    if st.session_state.p2_last_greeks_figure and st.session_state.p2_show_greeks:
-        chart_col = create_download_button(st.session_state.p2_last_greeks_figure, "Greeks")
-        chart_col.plotly_chart(st.session_state.p2_last_greeks_figure, use_container_width=True, key="p2_static_greeks")
-    
-    if st.session_state.p2_last_prob_figure and st.session_state.p2_show_prob:
-        chart_col = create_download_button(st.session_state.p2_last_prob_figure, "Probability")
-        chart_col.plotly_chart(st.session_state.p2_last_prob_figure, use_container_width=True, key="p2_static_prob")
+        static_charts.append((st.session_state.p2_last_gamma_figure, "p2_static_gamma"))
     
     if st.session_state.p2_last_expected_move_figure and st.session_state.p2_show_expected:
-        chart_col = create_download_button(st.session_state.p2_last_expected_move_figure, "ExpectedMove")
-        chart_col.plotly_chart(st.session_state.p2_last_expected_move_figure, use_container_width=True, key="p2_static_expected")
+        static_charts.append((st.session_state.p2_last_expected_move_figure, "p2_static_expected"))
+    
+    if st.session_state.p2_last_abs_gamma_figure and st.session_state.p2_show_abs_gex:
+        static_charts.append((st.session_state.p2_last_abs_gamma_figure, "p2_static_abs_gamma"))
+    
+    if st.session_state.p2_last_volume_figure and st.session_state.p2_show_volume:
+        static_charts.append((st.session_state.p2_last_volume_figure, "p2_static_volume"))
+    
+    if st.session_state.p2_last_iv_figure and st.session_state.p2_show_iv:
+        static_charts.append((st.session_state.p2_last_iv_figure, "p2_static_iv"))
+    
+    if st.session_state.p2_last_greeks_figure and st.session_state.p2_show_greeks:
+        static_charts.append((st.session_state.p2_last_greeks_figure, "p2_static_greeks"))
+    
+    if st.session_state.p2_last_prob_figure and st.session_state.p2_show_prob:
+        static_charts.append((st.session_state.p2_last_prob_figure, "p2_static_prob"))
+    
+    # Display charts in 2-column layout
+    for i in range(0, len(static_charts), 2):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(static_charts[i][0], width='stretch', key=static_charts[i][1])
+        if i + 1 < len(static_charts):
+            with col2:
+                st.plotly_chart(static_charts[i+1][0], width='stretch', key=static_charts[i+1][1])
+
+# Download section at bottom - only shown when data is ready
+if st.session_state.p2_data_ready:
+    st.markdown("---")
+    st.markdown("### 📥 Downloads")
+    
+    download_cols = st.columns(7)
+    chart_mapping = [
+        ("GEX", st.session_state.p2_last_gamma_figure, st.session_state.p2_show_gex),
+        ("AbsGEX", st.session_state.p2_last_abs_gamma_figure, st.session_state.p2_show_abs_gex),
+        ("Volume", st.session_state.p2_last_volume_figure, st.session_state.p2_show_volume),
+        ("IV", st.session_state.p2_last_iv_figure, st.session_state.p2_show_iv),
+        ("Greeks", st.session_state.p2_last_greeks_figure, st.session_state.p2_show_greeks),
+        ("Prob", st.session_state.p2_last_prob_figure, st.session_state.p2_show_prob),
+        ("ExpMove", st.session_state.p2_last_expected_move_figure, st.session_state.p2_show_expected),
+    ]
+    
+    for i, (chart_name, fig, is_visible) in enumerate(chart_mapping):
+        if is_visible and fig:
+            with download_cols[i]:
+                if st.button(f"📥 {chart_name}", key=f"dl_{chart_name}", use_container_width=True):
+                    img_bytes, filename = generate_chart_download(fig, chart_name)
+                    if img_bytes:
+                        st.download_button(
+                            label=f"⬇️ {chart_name}",
+                            data=img_bytes,
+                            file_name=filename,
+                            mime="image/png",
+                            key=f"dl_btn_{chart_name}",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error("Error generating image")

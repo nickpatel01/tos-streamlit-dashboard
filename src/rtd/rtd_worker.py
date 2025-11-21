@@ -51,6 +51,7 @@ class RTDWorker:
                                 QuoteType.THETA,
                                 QuoteType.VEGA,
                                 QuoteType.RHO,
+                                QuoteType.VOLUME,
                                 QuoteType.PROB_OF_EXPIRING,
                                 QuoteType.PROB_OTM,
                                 QuoteType.PROB_OF_TOUCHING
